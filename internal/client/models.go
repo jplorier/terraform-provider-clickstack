@@ -113,10 +113,24 @@ type SavedSearchSort struct {
 }
 
 // Source represents a ClickStack data source (read-only).
+//
+// Connection/From/TimestampValueExpression are populated by the self-hosted
+// (HyperDX OSS) /api/v2/sources endpoint, which returns the full source
+// document. The managed Cloud endpoint may omit them; they're tagged
+// omitempty so the same struct round-trips both shapes.
 type Source struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Kind string `json:"kind"`
+	ID                       string     `json:"id"`
+	Name                     string     `json:"name"`
+	Kind                     string     `json:"kind"`
+	Connection               string     `json:"connection,omitempty"`
+	From                     *SourceRef `json:"from,omitempty"`
+	TimestampValueExpression string     `json:"timestampValueExpression,omitempty"`
+}
+
+// SourceRef points at the ClickHouse database+table a source reads from.
+type SourceRef struct {
+	DatabaseName string `json:"databaseName"`
+	TableName    string `json:"tableName"`
 }
 
 // Webhook represents a ClickStack webhook (read-only).

@@ -7,29 +7,38 @@ import (
 	"context"
 	"os"
 
-	"github.com/teamlapse/terraform-provider-clickstack/internal/client"
-	"github.com/teamlapse/terraform-provider-clickstack/internal/datasources"
-	"github.com/teamlapse/terraform-provider-clickstack/internal/resources"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/teamlapse/terraform-provider-clickstack/internal/client"
+	"github.com/teamlapse/terraform-provider-clickstack/internal/datasources"
+	"github.com/teamlapse/terraform-provider-clickstack/internal/resources"
 )
 
 var _ provider.Provider = &ClickStackProvider{}
 
-// ClickStackProvider implements the Terraform provider for managed ClickStack.
+// ClickStackProvider implements the Terraform provider. It targets either
+// ClickHouse Cloud's managed ClickStack (HTTP Basic auth, Cloud API URL
+// shape) or a self-hosted HyperDX OSS deployment (Bearer auth, /api/v2/...
+// URL shape), depending on auth_mode.
 type ClickStackProvider struct {
 	version string
 }
 
 type clickStackProviderModel struct {
-	BaseURL        types.String `tfsdk:"base_url"`
+	BaseURL  types.String `tfsdk:"base_url"`
+	AuthMode types.String `tfsdk:"auth_mode"`
+
+	// Cloud
 	OrganizationID types.String `tfsdk:"organization_id"`
 	ServiceID      types.String `tfsdk:"service_id"`
 	APIKeyID       types.String `tfsdk:"api_key_id"`
 	APIKeySecret   types.String `tfsdk:"api_key_secret"`
+
+	// OSS
+	PersonalAccessKey types.String `tfsdk:"personal_access_key"`
 }
 
 // New returns a new provider factory function.
@@ -46,32 +55,55 @@ func (p *ClickStackProvider) Metadata(_ context.Context, _ provider.MetadataRequ
 
 func (p *ClickStackProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Terraform provider for managing dashboards and alerts on managed ClickStack (HyperDX on ClickHouse Cloud).",
+		Description: "Terraform provider for managing dashboards and alerts on ClickStack — either ClickHouse Cloud's managed offering or self-hosted HyperDX OSS.",
 		Attributes: map[string]schema.Attribute{
 			"base_url": schema.StringAttribute{
-				Description: "Base URL of the ClickHouse Cloud API. Defaults to https://api.clickhouse.cloud. Can also be set via CLICKSTACK_BASE_URL env var.",
+				Description: "Base URL of the ClickStack API. Defaults to https://api.clickhouse.cloud for cloud_api_key mode; required for personal_access_key mode (e.g. http://clickstack-api.clickstack.svc.cluster.local:8000). Can also be set via CLICKSTACK_BASE_URL env var.",
+				Optional:    true,
+			},
+			"auth_mode": schema.StringAttribute{
+				Description: "Authentication and API surface to use. One of `cloud_api_key` (ClickHouse Cloud managed ClickStack; default) or `personal_access_key` (self-hosted HyperDX OSS, /api/v2/ endpoints). Can also be set via CLICKSTACK_AUTH_MODE env var.",
 				Optional:    true,
 			},
 			"organization_id": schema.StringAttribute{
-				Description: "ClickHouse Cloud organization ID. Can also be set via CLICKSTACK_ORGANIZATION_ID env var.",
-				Required:    true,
+				Description: "ClickHouse Cloud organization ID (cloud_api_key mode only). Can also be set via CLICKSTACK_ORGANIZATION_ID env var.",
+				Optional:    true,
 			},
 			"service_id": schema.StringAttribute{
-				Description: "ClickHouse Cloud service ID for the ClickStack instance. Can also be set via CLICKSTACK_SERVICE_ID env var.",
-				Required:    true,
+				Description: "ClickHouse Cloud service ID for the ClickStack instance (cloud_api_key mode only). Can also be set via CLICKSTACK_SERVICE_ID env var.",
+				Optional:    true,
 			},
 			"api_key_id": schema.StringAttribute{
-				Description: "ClickHouse Cloud API key ID. Can also be set via CLICKSTACK_API_KEY_ID env var.",
-				Required:    true,
+				Description: "ClickHouse Cloud API key ID (cloud_api_key mode only). Can also be set via CLICKSTACK_API_KEY_ID env var.",
+				Optional:    true,
 				Sensitive:   true,
 			},
 			"api_key_secret": schema.StringAttribute{
-				Description: "ClickHouse Cloud API key secret. Can also be set via CLICKSTACK_API_KEY_SECRET env var.",
-				Required:    true,
+				Description: "ClickHouse Cloud API key secret (cloud_api_key mode only). Can also be set via CLICKSTACK_API_KEY_SECRET env var.",
+				Optional:    true,
+				Sensitive:   true,
+			},
+			"personal_access_key": schema.StringAttribute{
+				Description: "HyperDX OSS Personal API Access Key (personal_access_key mode only). Mint one in the HyperDX UI under Team Settings → API Keys. Can also be set via CLICKSTACK_PERSONAL_ACCESS_KEY env var.",
+				Optional:    true,
 				Sensitive:   true,
 			},
 		},
 	}
+}
+
+// firstNonEmpty returns the first non-empty string from a TF-config value
+// (if set) and a list of env var names, in order.
+func firstNonEmpty(cfg types.String, envVars ...string) string {
+	if !cfg.IsNull() && !cfg.IsUnknown() && cfg.ValueString() != "" {
+		return cfg.ValueString()
+	}
+	for _, env := range envVars {
+		if v := os.Getenv(env); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func (p *ClickStackProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
@@ -81,50 +113,83 @@ func (p *ClickStackProvider) Configure(ctx context.Context, req provider.Configu
 		return
 	}
 
-	baseURL := "https://api.clickhouse.cloud"
-	if !config.BaseURL.IsNull() && !config.BaseURL.IsUnknown() {
-		baseURL = config.BaseURL.ValueString()
-	} else if v := os.Getenv("CLICKSTACK_BASE_URL"); v != "" {
-		baseURL = v
+	authModeStr := firstNonEmpty(config.AuthMode, "CLICKSTACK_AUTH_MODE")
+	if authModeStr == "" {
+		authModeStr = string(client.AuthModeCloudAPIKey)
 	}
 
-	organizationID := config.OrganizationID.ValueString()
-	if organizationID == "" {
-		organizationID = os.Getenv("CLICKSTACK_ORGANIZATION_ID")
-	}
-	if organizationID == "" {
-		resp.Diagnostics.AddError("Missing organization_id", "organization_id must be set in the provider configuration or via CLICKSTACK_ORGANIZATION_ID env var.")
+	var authMode client.AuthMode
+	switch authModeStr {
+	case string(client.AuthModeCloudAPIKey):
+		authMode = client.AuthModeCloudAPIKey
+	case string(client.AuthModePersonalAccessKey):
+		authMode = client.AuthModePersonalAccessKey
+	default:
+		resp.Diagnostics.AddError(
+			"Invalid auth_mode",
+			"auth_mode must be one of \"cloud_api_key\" or \"personal_access_key\", got: "+authModeStr,
+		)
 		return
 	}
 
-	serviceID := config.ServiceID.ValueString()
-	if serviceID == "" {
-		serviceID = os.Getenv("CLICKSTACK_SERVICE_ID")
-	}
-	if serviceID == "" {
-		resp.Diagnostics.AddError("Missing service_id", "service_id must be set in the provider configuration or via CLICKSTACK_SERVICE_ID env var.")
-		return
-	}
-
-	apiKeyID := config.APIKeyID.ValueString()
-	if apiKeyID == "" {
-		apiKeyID = os.Getenv("CLICKSTACK_API_KEY_ID")
-	}
-	if apiKeyID == "" {
-		resp.Diagnostics.AddError("Missing api_key_id", "api_key_id must be set in the provider configuration or via CLICKSTACK_API_KEY_ID env var.")
-		return
+	baseURL := firstNonEmpty(config.BaseURL, "CLICKSTACK_BASE_URL")
+	if baseURL == "" {
+		if authMode == client.AuthModeCloudAPIKey {
+			baseURL = "https://api.clickhouse.cloud"
+		} else {
+			resp.Diagnostics.AddError(
+				"Missing base_url",
+				"base_url is required in personal_access_key mode. Set the provider attribute or CLICKSTACK_BASE_URL (e.g. http://clickstack-api.clickstack.svc.cluster.local:8000).",
+			)
+			return
+		}
 	}
 
-	apiKeySecret := config.APIKeySecret.ValueString()
-	if apiKeySecret == "" {
-		apiKeySecret = os.Getenv("CLICKSTACK_API_KEY_SECRET")
-	}
-	if apiKeySecret == "" {
-		resp.Diagnostics.AddError("Missing api_key_secret", "api_key_secret must be set in the provider configuration or via CLICKSTACK_API_KEY_SECRET env var.")
-		return
+	cfg := client.Config{
+		BaseURL:  baseURL,
+		AuthMode: authMode,
 	}
 
-	c := client.NewClient(baseURL, organizationID, serviceID, apiKeyID, apiKeySecret)
+	if authMode == client.AuthModeCloudAPIKey {
+		cfg.OrganizationID = firstNonEmpty(config.OrganizationID, "CLICKSTACK_ORGANIZATION_ID")
+		cfg.ServiceID = firstNonEmpty(config.ServiceID, "CLICKSTACK_SERVICE_ID")
+		cfg.APIKeyID = firstNonEmpty(config.APIKeyID, "CLICKSTACK_API_KEY_ID")
+		cfg.APIKeySecret = firstNonEmpty(config.APIKeySecret, "CLICKSTACK_API_KEY_SECRET")
+
+		missing := []string{}
+		if cfg.OrganizationID == "" {
+			missing = append(missing, "organization_id")
+		}
+		if cfg.ServiceID == "" {
+			missing = append(missing, "service_id")
+		}
+		if cfg.APIKeyID == "" {
+			missing = append(missing, "api_key_id")
+		}
+		if cfg.APIKeySecret == "" {
+			missing = append(missing, "api_key_secret")
+		}
+		for _, m := range missing {
+			resp.Diagnostics.AddError(
+				"Missing "+m,
+				m+" is required in cloud_api_key mode. Set the provider attribute or the matching CLICKSTACK_* env var.",
+			)
+		}
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	} else {
+		cfg.PersonalAccessKey = firstNonEmpty(config.PersonalAccessKey, "CLICKSTACK_PERSONAL_ACCESS_KEY")
+		if cfg.PersonalAccessKey == "" {
+			resp.Diagnostics.AddError(
+				"Missing personal_access_key",
+				"personal_access_key is required in personal_access_key mode. Set the provider attribute or CLICKSTACK_PERSONAL_ACCESS_KEY.",
+			)
+			return
+		}
+	}
+
+	c := client.NewClient(cfg)
 	resp.DataSourceData = c
 	resp.ResourceData = c
 }

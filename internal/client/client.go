@@ -13,30 +13,67 @@ import (
 	"time"
 )
 
-// Client is an HTTP client for the ClickStack API on ClickHouse Cloud.
-type Client struct {
-	baseURL        string
-	organizationID string
-	serviceID      string
-	apiKeyID       string
-	apiKeySecret   string
-	httpClient     *http.Client
+// AuthMode selects the API surface (Cloud vs self-hosted/OSS) and the
+// authentication style. The two modes are not interchangeable: each targets
+// a different URL path and credential scheme.
+type AuthMode string
+
+const (
+	// AuthModeCloudAPIKey targets ClickHouse Cloud's managed ClickStack:
+	// HTTP Basic auth (apiKeyID:apiKeySecret) against
+	// {base_url}/v1/organizations/{org}/services/{svc}/clickstack/{resource}.
+	AuthModeCloudAPIKey AuthMode = "cloud_api_key"
+
+	// AuthModePersonalAccessKey targets self-hosted HyperDX OSS:
+	// Bearer auth (a Personal API Access Key minted in Team Settings)
+	// against {base_url}/api/v2/{resource}.
+	AuthModePersonalAccessKey AuthMode = "personal_access_key"
+)
+
+// Config carries all credentials and endpoint info needed to construct a
+// Client. Only the fields relevant to AuthMode need to be populated.
+type Config struct {
+	BaseURL  string
+	AuthMode AuthMode
+
+	// Cloud (AuthModeCloudAPIKey)
+	OrganizationID string
+	ServiceID      string
+	APIKeyID       string
+	APIKeySecret   string
+
+	// OSS (AuthModePersonalAccessKey)
+	PersonalAccessKey string
 }
 
-// NewClient creates a new ClickStack API client.
-func NewClient(baseURL, organizationID, serviceID, apiKeyID, apiKeySecret string) *Client {
+// Client is an HTTP client for the ClickStack API, supporting both
+// ClickHouse Cloud (managed) and self-hosted HyperDX OSS.
+type Client struct {
+	cfg        Config
+	httpClient *http.Client
+}
+
+// NewClient creates a new ClickStack API client from a Config.
+func NewClient(cfg Config) *Client {
+	if cfg.AuthMode == "" {
+		cfg.AuthMode = AuthModeCloudAPIKey
+	}
 	return &Client{
-		baseURL:        baseURL,
-		organizationID: organizationID,
-		serviceID:      serviceID,
-		apiKeyID:       apiKeyID,
-		apiKeySecret:   apiKeySecret,
-		httpClient:     &http.Client{Timeout: 30 * time.Second},
+		cfg:        cfg,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
+func (c *Client) isOSS() bool {
+	return c.cfg.AuthMode == AuthModePersonalAccessKey
+}
+
 func (c *Client) basePath() string {
-	return fmt.Sprintf("%s/v1/organizations/%s/services/%s/clickstack", c.baseURL, c.organizationID, c.serviceID)
+	if c.isOSS() {
+		return c.cfg.BaseURL + "/api/v2"
+	}
+	return fmt.Sprintf("%s/v1/organizations/%s/services/%s/clickstack",
+		c.cfg.BaseURL, c.cfg.OrganizationID, c.cfg.ServiceID)
 }
 
 func (c *Client) doRequest(ctx context.Context, method, path string, body any) ([]byte, error) {
@@ -54,7 +91,11 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any) (
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 
-	req.SetBasicAuth(c.apiKeyID, c.apiKeySecret)
+	if c.isOSS() {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.PersonalAccessKey)
+	} else {
+		req.SetBasicAuth(c.cfg.APIKeyID, c.cfg.APIKeySecret)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
@@ -86,14 +127,36 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any) (
 	return respBody, nil
 }
 
-// unwrapResult extracts the "result" field from the API response envelope.
+// unwrapResult extracts the payload from the API response envelope. Cloud
+// returns `{status, requestId, result: T}`; OSS returns `{data: T}`. We
+// probe for whichever key is present so call sites don't need to branch.
 func unwrapResult[T any](data []byte) (T, error) {
-	var resp APIResponse[T]
-	if err := json.Unmarshal(data, &resp); err != nil {
-		var zero T
+	var zero T
+
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
 		return zero, fmt.Errorf("unmarshaling response: %w", err)
 	}
-	return resp.Result, nil
+
+	for _, key := range []string{"result", "data"} {
+		raw, ok := probe[key]
+		if !ok || len(raw) == 0 || string(raw) == "null" {
+			continue
+		}
+		var v T
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return zero, fmt.Errorf("unmarshaling %q: %w", key, err)
+		}
+		return v, nil
+	}
+
+	return zero, fmt.Errorf("response had neither 'result' nor 'data' payload: %s", string(data))
+}
+
+// errOSSUnsupported is returned by client methods whose endpoint doesn't
+// exist in the OSS external v2 API surface.
+func errOSSUnsupported(op string) error {
+	return fmt.Errorf("%s is not supported by self-hosted HyperDX OSS (no external API endpoint); manage in the UI", op)
 }
 
 // NotFoundError is returned when the API returns a 404.
@@ -150,6 +213,7 @@ func (c *Client) CreateDashboard(ctx context.Context, dashboard Dashboard) (*Das
 }
 
 func (c *Client) UpdateDashboard(ctx context.Context, id string, dashboard Dashboard) (*Dashboard, error) {
+	// Both Cloud and OSS external v2 update dashboards via PUT /dashboards/:id.
 	data, err := c.doRequest(ctx, http.MethodPut, "/dashboards/"+id, dashboard)
 	if err != nil {
 		return nil, err
@@ -218,8 +282,13 @@ func (c *Client) DeleteAlert(ctx context.Context, id string) error {
 }
 
 // --- Saved Searches ---
+//
+// Not exposed by the self-hosted external v2 API; Cloud-only.
 
 func (c *Client) ListSavedSearches(ctx context.Context) ([]SavedSearch, error) {
+	if c.isOSS() {
+		return nil, errOSSUnsupported("ListSavedSearches")
+	}
 	data, err := c.doRequest(ctx, http.MethodGet, "/savedSearches", nil)
 	if err != nil {
 		return nil, err
@@ -228,6 +297,9 @@ func (c *Client) ListSavedSearches(ctx context.Context) ([]SavedSearch, error) {
 }
 
 func (c *Client) GetSavedSearch(ctx context.Context, id string) (*SavedSearch, error) {
+	if c.isOSS() {
+		return nil, errOSSUnsupported("GetSavedSearch")
+	}
 	data, err := c.doRequest(ctx, http.MethodGet, "/savedSearches/"+id, nil)
 	if err != nil {
 		return nil, err
@@ -240,6 +312,9 @@ func (c *Client) GetSavedSearch(ctx context.Context, id string) (*SavedSearch, e
 }
 
 func (c *Client) CreateSavedSearch(ctx context.Context, search SavedSearch) (*SavedSearch, error) {
+	if c.isOSS() {
+		return nil, errOSSUnsupported("CreateSavedSearch")
+	}
 	data, err := c.doRequest(ctx, http.MethodPost, "/savedSearches", search)
 	if err != nil {
 		return nil, err
@@ -252,6 +327,9 @@ func (c *Client) CreateSavedSearch(ctx context.Context, search SavedSearch) (*Sa
 }
 
 func (c *Client) UpdateSavedSearch(ctx context.Context, id string, search SavedSearch) (*SavedSearch, error) {
+	if c.isOSS() {
+		return nil, errOSSUnsupported("UpdateSavedSearch")
+	}
 	data, err := c.doRequest(ctx, http.MethodPut, "/savedSearches/"+id, search)
 	if err != nil {
 		return nil, err
@@ -264,6 +342,9 @@ func (c *Client) UpdateSavedSearch(ctx context.Context, id string, search SavedS
 }
 
 func (c *Client) DeleteSavedSearch(ctx context.Context, id string) error {
+	if c.isOSS() {
+		return errOSSUnsupported("DeleteSavedSearch")
+	}
 	_, err := c.doRequest(ctx, http.MethodDelete, "/savedSearches/"+id, nil)
 	return err
 }

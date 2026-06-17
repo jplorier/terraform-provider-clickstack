@@ -32,7 +32,12 @@ The binary will be installed to `$GOPATH/bin/terraform-provider-clickstack`.
 
 ## Authentication
 
-The provider authenticates with the ClickHouse Cloud API using an API key pair. You can configure credentials via provider arguments or environment variables:
+The provider supports two modes, selected by `auth_mode` (or `CLICKSTACK_AUTH_MODE`):
+
+- `cloud_api_key` (default) — ClickHouse Cloud's managed ClickStack, using an API key pair over HTTP Basic auth.
+- `personal_access_key` — self-hosted HyperDX OSS, using a Personal API Access Key (Bearer auth) against the `/api/v2/` endpoints.
+
+### ClickHouse Cloud (`cloud_api_key`)
 
 | Provider Argument   | Environment Variable           | Description                        |
 |---------------------|--------------------------------|------------------------------------|
@@ -50,6 +55,25 @@ provider "clickstack" {
   api_key_secret  = var.clickstack_api_key_secret
 }
 ```
+
+### Self-hosted HyperDX OSS (`personal_access_key`)
+
+Mint a Personal API Access Key in the HyperDX UI under **Team Settings → API Keys**.
+
+| Provider Argument     | Environment Variable             | Description                          |
+|-----------------------|----------------------------------|--------------------------------------|
+| `personal_access_key` | `CLICKSTACK_PERSONAL_ACCESS_KEY` | HyperDX Personal API Access Key      |
+| `base_url`            | `CLICKSTACK_BASE_URL`            | API base URL (required, e.g. `http://localhost:8000`) |
+
+```hcl
+provider "clickstack" {
+  auth_mode           = "personal_access_key"
+  base_url            = "http://localhost:8000"
+  personal_access_key = var.clickstack_personal_access_key
+}
+```
+
+> Some resources are mode-specific: `clickstack_saved_search` is Cloud-only, and `clickstack_connection` is OSS-only.
 
 ## Resources
 

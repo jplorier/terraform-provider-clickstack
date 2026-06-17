@@ -23,9 +23,13 @@ type sourcesDataSourceModel struct {
 }
 
 type sourceModel struct {
-	ID   types.String `tfsdk:"id"`
-	Name types.String `tfsdk:"name"`
-	Kind types.String `tfsdk:"kind"`
+	ID                       types.String `tfsdk:"id"`
+	Name                     types.String `tfsdk:"name"`
+	Kind                     types.String `tfsdk:"kind"`
+	Connection               types.String `tfsdk:"connection"`
+	FromDatabase             types.String `tfsdk:"from_database"`
+	FromTable                types.String `tfsdk:"from_table"`
+	TimestampValueExpression types.String `tfsdk:"timestamp_value_expression"`
 }
 
 func NewSourcesDataSource() datasource.DataSource {
@@ -57,6 +61,22 @@ func (d *SourcesDataSource) Schema(_ context.Context, _ datasource.SchemaRequest
 							Computed:    true,
 							Description: "Source kind (log, trace, metric, session).",
 						},
+						"connection": schema.StringAttribute{
+							Computed:    true,
+							Description: "ClickHouse connection ID this source reads from. Populated by self-hosted HyperDX OSS; may be empty on managed Cloud. Useful as the `connection` field in dashboard tile configs.",
+						},
+						"from_database": schema.StringAttribute{
+							Computed:    true,
+							Description: "ClickHouse database the source queries (e.g. `default` or `otel`). Populated by self-hosted HyperDX OSS.",
+						},
+						"from_table": schema.StringAttribute{
+							Computed:    true,
+							Description: "ClickHouse table the source queries (e.g. `otel_logs`). Empty for metric sources, which fan out across gauge/sum/histogram tables.",
+						},
+						"timestamp_value_expression": schema.StringAttribute{
+							Computed:    true,
+							Description: "SQL expression for the source's timestamp column. Populated by self-hosted HyperDX OSS.",
+						},
 					},
 				},
 			},
@@ -87,10 +107,19 @@ func (d *SourcesDataSource) Read(ctx context.Context, _ datasource.ReadRequest, 
 		Sources: []sourceModel{},
 	}
 	for _, s := range sources {
+		fromDB, fromTable := "", ""
+		if s.From != nil {
+			fromDB = s.From.DatabaseName
+			fromTable = s.From.TableName
+		}
 		state.Sources = append(state.Sources, sourceModel{
-			ID:   types.StringValue(s.ID),
-			Name: types.StringValue(s.Name),
-			Kind: types.StringValue(s.Kind),
+			ID:                       types.StringValue(s.ID),
+			Name:                     types.StringValue(s.Name),
+			Kind:                     types.StringValue(s.Kind),
+			Connection:               types.StringValue(s.Connection),
+			FromDatabase:             types.StringValue(fromDB),
+			FromTable:                types.StringValue(fromTable),
+			TimestampValueExpression: types.StringValue(s.TimestampValueExpression),
 		})
 	}
 

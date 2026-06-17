@@ -15,7 +15,14 @@ func testServer(t *testing.T, handler http.Handler) *Client {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	return NewClient(srv.URL, "org-1", "svc-1", "key-id", "key-secret")
+	return NewClient(Config{
+		BaseURL:        srv.URL,
+		AuthMode:       AuthModeCloudAPIKey,
+		OrganizationID: "org-1",
+		ServiceID:      "svc-1",
+		APIKeyID:       "key-id",
+		APIKeySecret:   "key-secret",
+	})
 }
 
 func jsonResponse(t *testing.T, w http.ResponseWriter, status int, result any) {
