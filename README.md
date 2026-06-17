@@ -79,7 +79,8 @@ provider "clickstack" {
 
 - `clickstack_dashboard` — Manage observability dashboards with tiles, filters, and queries.
 - `clickstack_alert` — Manage threshold-based alerts from dashboard tiles or saved searches.
-- `clickstack_saved_search` — Manage reusable search queries.
+- `clickstack_saved_search` — Manage reusable search queries (Cloud only).
+- `clickstack_connection` — Manage ClickHouse connections (self-hosted HyperDX OSS only).
 
 ## Data Sources
 

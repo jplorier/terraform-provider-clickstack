@@ -133,6 +133,23 @@ type SourceRef struct {
 	TableName    string `json:"tableName"`
 }
 
+// Connection represents a ClickHouse connection. This is a self-hosted
+// HyperDX OSS concept (managed Cloud provisions the connection for you), so
+// it is only available in personal_access_key auth mode. The API never
+// returns the password.
+type Connection struct {
+	ID       string `json:"id,omitempty"`
+	Name     string `json:"name"`
+	Host     string `json:"host"`
+	Username string `json:"username"`
+	Password string `json:"password,omitempty"`
+	// nil means "unset": omitted on create, cleared on update.
+	HyperdxSettingPrefix *string `json:"hyperdxSettingPrefix,omitempty"`
+	PrometheusEndpoint   *string `json:"prometheusEndpoint,omitempty"`
+	CreatedAt            *string `json:"createdAt,omitempty"`
+	UpdatedAt            *string `json:"updatedAt,omitempty"`
+}
+
 // Webhook represents a ClickStack webhook (read-only).
 type Webhook struct {
 	ID          string  `json:"id"`

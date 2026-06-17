@@ -25,6 +25,29 @@ func testServer(t *testing.T, handler http.Handler) *Client {
 	})
 }
 
+// testServerOSS builds a client in personal_access_key (OSS) mode pointed at
+// a test server.
+func testServerOSS(t *testing.T, handler http.Handler) *Client {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return NewClient(Config{
+		BaseURL:           srv.URL,
+		AuthMode:          AuthModePersonalAccessKey,
+		PersonalAccessKey: "pat-123",
+	})
+}
+
+// jsonDataResponse mimics the OSS external v2 `{data: ...}` envelope.
+func jsonDataResponse(t *testing.T, w http.ResponseWriter, status int, data any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(map[string]any{"data": data}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func jsonResponse(t *testing.T, w http.ResponseWriter, status int, result any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
@@ -333,6 +356,80 @@ func TestClient_ListSources(t *testing.T) {
 	}
 	if sources[0].Kind != "log" {
 		t.Errorf("expected kind 'log', got %q", sources[0].Kind)
+	}
+}
+
+// --- Connections (OSS only) ---
+
+func TestClient_CreateConnection(t *testing.T) {
+	c := testServerOSS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/api/v2/connections" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer pat-123" {
+			t.Errorf("expected bearer auth, got %q", got)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		// Unset optional fields must be omitted on create (null prometheus
+		// would fail the API's url validation).
+		if _, ok := body["prometheusEndpoint"]; ok {
+			t.Errorf("expected prometheusEndpoint omitted on create, body: %v", body)
+		}
+		jsonDataResponse(t, w, 200, Connection{ID: "conn-1", Name: "Prod", Host: "https://ch:8443", Username: "default"})
+	}))
+
+	conn, err := c.CreateConnection(context.Background(), Connection{Name: "Prod", Host: "https://ch:8443", Username: "default", Password: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn.ID != "conn-1" {
+		t.Errorf("expected id conn-1, got %s", conn.ID)
+	}
+}
+
+func TestClient_UpdateConnection_ClearsOptionalFields(t *testing.T) {
+	c := testServerOSS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("expected PUT, got %s", r.Method)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		// Unset optional fields are sent explicitly so the server clears them.
+		if v, ok := body["hyperdxSettingPrefix"]; !ok || v != "" {
+			t.Errorf("expected hyperdxSettingPrefix \"\", got %v (present=%v)", v, ok)
+		}
+		if v, ok := body["prometheusEndpoint"]; !ok || v != nil {
+			t.Errorf("expected prometheusEndpoint null, got %v (present=%v)", v, ok)
+		}
+		// Empty password is omitted to keep the existing one.
+		if _, ok := body["password"]; ok {
+			t.Errorf("expected password omitted, body: %v", body)
+		}
+		jsonDataResponse(t, w, 200, Connection{ID: "conn-1", Name: "Prod", Host: "https://ch:8443", Username: "default"})
+	}))
+
+	_, err := c.UpdateConnection(context.Background(), "conn-1", Connection{Name: "Prod", Host: "https://ch:8443", Username: "default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClient_Connection_CloudUnsupported(t *testing.T) {
+	c := testServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be called in cloud mode")
+		jsonResponse(t, w, 200, nil)
+	}))
+
+	if _, err := c.ListConnections(context.Background()); err == nil {
+		t.Fatal("expected error for connections in cloud mode")
 	}
 }
 

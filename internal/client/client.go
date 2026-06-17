@@ -159,6 +159,13 @@ func errOSSUnsupported(op string) error {
 	return fmt.Errorf("%s is not supported by self-hosted HyperDX OSS (no external API endpoint); manage in the UI", op)
 }
 
+// errCloudUnsupported is returned by client methods whose endpoint only
+// exists in self-hosted HyperDX OSS. ClickHouse Cloud manages the underlying
+// ClickHouse connection for you, so it has no connections API.
+func errCloudUnsupported(op string) error {
+	return fmt.Errorf("%s is only supported by self-hosted HyperDX OSS (personal_access_key auth_mode); ClickHouse Cloud manages the connection for you", op)
+}
+
 // NotFoundError is returned when the API returns a 404.
 type NotFoundError struct {
 	Message   string
@@ -367,4 +374,96 @@ func (c *Client) ListWebhooks(ctx context.Context) ([]Webhook, error) {
 		return nil, err
 	}
 	return unwrapResult[[]Webhook](data)
+}
+
+// --- Connections ---
+//
+// Self-hosted HyperDX OSS only; ClickHouse Cloud manages the connection.
+
+func (c *Client) ListConnections(ctx context.Context) ([]Connection, error) {
+	if !c.isOSS() {
+		return nil, errCloudUnsupported("ListConnections")
+	}
+	data, err := c.doRequest(ctx, http.MethodGet, "/connections", nil)
+	if err != nil {
+		return nil, err
+	}
+	return unwrapResult[[]Connection](data)
+}
+
+func (c *Client) GetConnection(ctx context.Context, id string) (*Connection, error) {
+	if !c.isOSS() {
+		return nil, errCloudUnsupported("GetConnection")
+	}
+	data, err := c.doRequest(ctx, http.MethodGet, "/connections/"+id, nil)
+	if err != nil {
+		return nil, err
+	}
+	result, err := unwrapResult[Connection](data)
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) CreateConnection(ctx context.Context, conn Connection) (*Connection, error) {
+	if !c.isOSS() {
+		return nil, errCloudUnsupported("CreateConnection")
+	}
+	data, err := c.doRequest(ctx, http.MethodPost, "/connections", conn)
+	if err != nil {
+		return nil, err
+	}
+	result, err := unwrapResult[Connection](data)
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) UpdateConnection(ctx context.Context, id string, conn Connection) (*Connection, error) {
+	if !c.isOSS() {
+		return nil, errCloudUnsupported("UpdateConnection")
+	}
+	// Send the optional fields explicitly so that clearing them in config
+	// clears them server-side: '' clears the setting prefix and null clears
+	// the Prometheus endpoint. Omitting either would instead preserve the
+	// existing value, leaving Terraform in perpetual drift. An empty password
+	// is still omitted so the existing one is kept.
+	prefix := ""
+	if conn.HyperdxSettingPrefix != nil {
+		prefix = *conn.HyperdxSettingPrefix
+	}
+	body := struct {
+		Name                 string  `json:"name"`
+		Host                 string  `json:"host"`
+		Username             string  `json:"username"`
+		Password             string  `json:"password,omitempty"`
+		HyperdxSettingPrefix string  `json:"hyperdxSettingPrefix"`
+		PrometheusEndpoint   *string `json:"prometheusEndpoint"`
+	}{
+		Name:                 conn.Name,
+		Host:                 conn.Host,
+		Username:             conn.Username,
+		Password:             conn.Password,
+		HyperdxSettingPrefix: prefix,
+		PrometheusEndpoint:   conn.PrometheusEndpoint,
+	}
+	data, err := c.doRequest(ctx, http.MethodPut, "/connections/"+id, body)
+	if err != nil {
+		return nil, err
+	}
+	result, err := unwrapResult[Connection](data)
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) DeleteConnection(ctx context.Context, id string) error {
+	if !c.isOSS() {
+		return errCloudUnsupported("DeleteConnection")
+	}
+	_, err := c.doRequest(ctx, http.MethodDelete, "/connections/"+id, nil)
+	return err
 }

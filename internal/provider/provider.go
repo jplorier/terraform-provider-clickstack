@@ -199,6 +199,7 @@ func (p *ClickStackProvider) Resources(_ context.Context) []func() resource.Reso
 		resources.NewDashboardResource,
 		resources.NewAlertResource,
 		resources.NewSavedSearchResource,
+		resources.NewConnectionResource,
 	}
 }
 

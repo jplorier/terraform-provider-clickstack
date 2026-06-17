@@ -25,6 +25,7 @@ type Server struct {
 	dashboards    map[string]client.Dashboard
 	alerts        map[string]client.Alert
 	savedSearches map[string]client.SavedSearch
+	connections   map[string]client.Connection
 	sources       []client.Source
 	webhooks      []client.Webhook
 }
@@ -38,6 +39,7 @@ func NewServer(t *testing.T) *Server {
 		dashboards:    make(map[string]client.Dashboard),
 		alerts:        make(map[string]client.Alert),
 		savedSearches: make(map[string]client.SavedSearch),
+		connections:   make(map[string]client.Connection),
 		sources: []client.Source{
 			{ID: "src-log", Name: "Log Source", Kind: "log"},
 			{ID: "src-trace", Name: "Trace Source", Kind: "trace"},
@@ -144,6 +146,32 @@ func NewServer(t *testing.T) *Server {
 		writeJSON(t, w, 200, s.webhooks)
 	})
 
+	// Connections are OSS-only and live on the self-hosted /api/v2 surface
+	// with the `{data: ...}` response envelope.
+	mux.HandleFunc("/api/v2/connections", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			s.listConnections(t, w)
+		case http.MethodPost:
+			s.createConnection(t, w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/api/v2/connections/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/api/v2/connections/")
+		switch r.Method {
+		case http.MethodGet:
+			s.getConnection(t, w, id)
+		case http.MethodPut:
+			s.updateConnection(t, w, r, id)
+		case http.MethodDelete:
+			s.deleteConnection(t, w, id)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
 	s.Server = httptest.NewServer(mux)
 	t.Cleanup(s.Close)
 	return s
@@ -158,6 +186,18 @@ provider "clickstack" {
   service_id      = "test-svc"
   api_key_id      = "test-key"
   api_key_secret  = "test-secret"
+}
+`, s.URL)
+}
+
+// OSSProviderConfig returns an HCL provider block in personal_access_key
+// (self-hosted HyperDX OSS) mode pointing at this mock server.
+func (s *Server) OSSProviderConfig() string {
+	return fmt.Sprintf(`
+provider "clickstack" {
+  base_url            = %q
+  auth_mode           = "personal_access_key"
+  personal_access_key = "test-pat"
 }
 `, s.URL)
 }
@@ -409,7 +449,103 @@ func (s *Server) deleteSavedSearch(t *testing.T, w http.ResponseWriter, id strin
 	writeJSON(t, w, 200, nil)
 }
 
+// --- Connection handlers (OSS /api/v2 surface) ---
+
+func (s *Server) listConnections(t *testing.T, w http.ResponseWriter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	conns := make([]client.Connection, 0, len(s.connections))
+	for _, c := range s.connections {
+		conns = append(conns, redactPassword(c))
+	}
+	writeDataJSON(t, w, 200, conns)
+}
+
+func (s *Server) createConnection(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	var c client.Connection
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		writeError(t, w, 400, "invalid request body")
+		return
+	}
+	c.ID = s.genID()
+	s.mu.Lock()
+	s.connections[c.ID] = c
+	s.mu.Unlock()
+	writeDataJSON(t, w, 200, redactPassword(c))
+}
+
+func (s *Server) getConnection(t *testing.T, w http.ResponseWriter, id string) {
+	s.mu.Lock()
+	c, ok := s.connections[id]
+	s.mu.Unlock()
+	if !ok {
+		writeError(t, w, 404, "connection not found")
+		return
+	}
+	writeDataJSON(t, w, 200, redactPassword(c))
+}
+
+func (s *Server) updateConnection(t *testing.T, w http.ResponseWriter, r *http.Request, id string) {
+	s.mu.Lock()
+	existing, ok := s.connections[id]
+	s.mu.Unlock()
+	if !ok {
+		writeError(t, w, 404, "connection not found")
+		return
+	}
+	var c client.Connection
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		writeError(t, w, 400, "invalid request body")
+		return
+	}
+	c.ID = id
+	// An empty password keeps the existing one, matching the real API.
+	if c.Password == "" {
+		c.Password = existing.Password
+	}
+	// The real backend clears (unsets) the optional fields when the update
+	// sends an empty prefix or a null endpoint, so a subsequent read returns
+	// them absent rather than as empty strings.
+	if c.HyperdxSettingPrefix != nil && *c.HyperdxSettingPrefix == "" {
+		c.HyperdxSettingPrefix = nil
+	}
+	s.mu.Lock()
+	s.connections[id] = c
+	s.mu.Unlock()
+	writeDataJSON(t, w, 200, redactPassword(c))
+}
+
+func (s *Server) deleteConnection(t *testing.T, w http.ResponseWriter, id string) {
+	s.mu.Lock()
+	_, ok := s.connections[id]
+	if ok {
+		delete(s.connections, id)
+	}
+	s.mu.Unlock()
+	if !ok {
+		writeError(t, w, 404, "connection not found")
+		return
+	}
+	writeDataJSON(t, w, 200, map[string]any{})
+}
+
+// redactPassword mimics the real API, which never returns the password.
+func redactPassword(c client.Connection) client.Connection {
+	c.Password = ""
+	return c
+}
+
 // --- Helpers ---
+
+// writeDataJSON writes the OSS external v2 `{data: ...}` response envelope.
+func writeDataJSON(t *testing.T, w http.ResponseWriter, status int, data any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(map[string]any{"data": data}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func writeJSON(t *testing.T, w http.ResponseWriter, status int, result any) {
 	t.Helper()
