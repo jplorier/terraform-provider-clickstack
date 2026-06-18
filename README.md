@@ -144,6 +144,39 @@ go generate ./...
 
 This runs `tfplugindocs` to regenerate the `docs/` directory from schema descriptions and example files.
 
+## Publishing
+
+Publishing happens in two phases: GitHub builds and signs the artifacts, then those artifacts are registered into a [Terrakube](https://terrakube.io) private registry (Terrakube stores only metadata and points at the GitHub release).
+
+### 1. Build & sign a release (GitHub Actions)
+
+Tagging `vX.Y.Z` triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which runs GoReleaser to build all `os/arch` zips, a `SHA256SUMS` file, and a detached GPG signature, and attaches them to a GitHub release.
+
+Requires two repository secrets:
+
+- `GPG_PRIVATE_KEY` — ASCII-armored private key (`gpg --armor --export-secret-keys <fingerprint>`)
+- `GPG_PASSPHRASE` — its passphrase
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+### 2. Register the version into Terrakube
+
+There is no UI for providers; registration is done via the Terrakube API. Run [`scripts/terrakube-register.sh`](scripts/terrakube-register.sh) from somewhere that can reach both the Terrakube API and github.com (typically inside the cluster or via a port-forward):
+
+```bash
+TERRAKUBE_URL=https://terrakube-api.example.com \
+TERRAKUBE_TOKEN=<terrakube-pat> \
+TERRAKUBE_ORG_ID=<org-uuid> \
+GPG_FINGERPRINT=<signing-key-fingerprint> \
+VERSION=0.1.0 \
+scripts/terrakube-register.sh
+```
+
+It reads the release's `SHA256SUMS` and creates the provider, the version, and one implementation per platform. Reference it afterwards with `source = "<terrakube-host>/<org-name>/clickstack"`.
+
 ## License
 
 This project is licensed under the [Mozilla Public License 2.0](LICENSE).
